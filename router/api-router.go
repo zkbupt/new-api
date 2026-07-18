@@ -178,6 +178,24 @@ func SetApiRouter(router *gin.Engine) {
 			subscriptionAdminRoute.DELETE("/user_subscriptions/:id", controller.AdminDeleteUserSubscription)
 		}
 
+		// 钱包内部接口（M2M）：仅供 Wallet Bridge / Settlement Worker 经内部
+		// HMAC 鉴权调用，只应在内部网络暴露。见实施计划 v2 §2.2。
+		// 挂在引擎根而非 apiRouter，绕开面向公网用户的 GlobalAPIRateLimit（默认 360/180s
+		// 每 IP）：Bridge/Worker 从固定 IP 高频调 reserve/settle/rollback，公开限流会误伤
+		// 合法结算；本组自带 HMAC + nonce 防重放 + 私网 CIDR 二层，不依赖公开限流。
+		internalRoute := router.Group("/api/internal")
+		internalRoute.Use(middleware.InternalWalletAuth())
+		{
+			walletRoute := internalRoute.Group("/wallet")
+			walletRoute.POST("/validate", controller.WalletValidate)
+			walletRoute.POST("/reserve", controller.WalletReserve)
+			walletRoute.POST("/settle", controller.WalletSettle)
+			walletRoute.POST("/rollback", controller.WalletRollback)
+			walletRoute.POST("/resolve-key", controller.WalletResolveKey)
+			walletRoute.POST("/stale-reservations", controller.WalletStaleReservations)
+			walletRoute.GET("/transactions/:request_id", controller.WalletGetTransaction)
+		}
+
 		// Subscription payment callbacks (no auth)
 		apiRouter.POST("/subscription/epay/notify", anonymousRequestBodyLimit, controller.SubscriptionEpayNotify)
 		apiRouter.GET("/subscription/epay/notify", controller.SubscriptionEpayNotify)

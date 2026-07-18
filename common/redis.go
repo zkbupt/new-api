@@ -78,6 +78,13 @@ func RedisGet(key string) (string, error) {
 	return val, err
 }
 
+// RedisSetNX 原子地 set-if-not-exists，返回是否成功写入（key 此前不存在）。
+// 用于 nonce 防重放等一次性令牌场景。
+func RedisSetNX(key string, value string, expiration time.Duration) (bool, error) {
+	ctx := context.Background()
+	return RDB.SetNX(ctx, key, value, expiration).Result()
+}
+
 //func RedisExpire(key string, expiration time.Duration) error {
 //	ctx := context.Background()
 //	return RDB.Expire(ctx, key, expiration).Err()

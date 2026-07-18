@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -15,6 +16,10 @@ import (
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 )
+
+// transactionalWalletEnabled 门控 A 线是否改用事务钱包（TransactionalWalletFunding），
+// 使 A/B 共用同一原子钱包写入口。默认关闭；启用前需完成 A 线集成测试（见实施计划 §2.3）。
+var transactionalWalletEnabled = common.GetEnvOrDefaultBool("WALLET_TRANSACTIONAL_ENABLED", false)
 
 // ---------------------------------------------------------------------------
 // BillingSession — 统一计费会话
@@ -237,6 +242,16 @@ func (s *BillingSession) reserveFunding(delta int) error {
 		}
 		funding.consumed += delta
 		return nil
+	case *TransactionalWalletFunding:
+		txn, err := model.TopUpWalletReservation(funding.requestId, delta)
+		if err != nil {
+			if errors.Is(err, model.ErrWalletInsufficientQuota) {
+				return types.NewErrorWithStatusCode(err, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+			}
+			return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+		}
+		funding.reserved = txn.ReservedQuota
+		return nil
 	case *SubscriptionFunding:
 		if err := model.PostConsumeUserSubscriptionDelta(funding.subscriptionId, int64(delta)); err != nil {
 			return types.NewErrorWithStatusCode(
@@ -261,6 +276,12 @@ func (s *BillingSession) rollbackFundingReserve(delta int) {
 		} else {
 			funding.consumed -= delta
 		}
+	case *TransactionalWalletFunding:
+		if txn, err := model.TopUpWalletReservation(funding.requestId, -delta); err != nil {
+			common.SysLog("error rolling back transactional wallet reserve: " + err.Error())
+		} else {
+			funding.reserved = txn.ReservedQuota
+		}
 	case *SubscriptionFunding:
 		if err := model.PostConsumeUserSubscriptionDelta(funding.subscriptionId, -int64(delta)); err != nil {
 			common.SysLog("error rolling back subscription funding reserve: " + err.Error())
@@ -282,6 +303,11 @@ func (s *BillingSession) reserveToken(delta int) error {
 func (s *BillingSession) shouldTrust(c *gin.Context) bool {
 	// 异步任务（ForcePreConsume=true）必须预扣全额，不允许信任旁路
 	if s.relayInfo.ForcePreConsume {
+		return false
+	}
+
+	// 事务钱包不启用信任旁路：保证请求始终有预留可结算/回滚（transactional 语义要求）。
+	if _, ok := s.funding.(*TransactionalWalletFunding); ok {
 		return false
 	}
 
@@ -366,9 +392,19 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 		}
 		relayInfo.UserQuota = userQuota
 
+		var walletFunding FundingSource
+		if transactionalWalletEnabled {
+			walletFunding = &TransactionalWalletFunding{
+				requestId: relayInfo.RequestId,
+				userId:    relayInfo.UserId,
+				tokenId:   relayInfo.TokenId,
+			}
+		} else {
+			walletFunding = &WalletFunding{userId: relayInfo.UserId}
+		}
 		session := &BillingSession{
 			relayInfo: relayInfo,
-			funding:   &WalletFunding{userId: relayInfo.UserId},
+			funding:   walletFunding,
 		}
 		if apiErr := session.preConsume(c, preConsumedQuota); apiErr != nil {
 			return nil, apiErr

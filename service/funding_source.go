@@ -64,6 +64,57 @@ func (w *WalletFunding) Refund() error {
 }
 
 // ---------------------------------------------------------------------------
+// TransactionalWalletFunding — 事务钱包资金来源（A/B 共用同一原子钱包）
+// ---------------------------------------------------------------------------
+//
+// 与 WalletFunding 不同：走 model 的数据库权威 reserve/settle/rollback 原语（余额
+// 条件更新 + wallet_transactions 同事务），使 A 线与 B 线共用同一不透支写入口。
+// 由 WALLET_TRANSACTIONAL_ENABLED 门控；启用时禁用信任额度旁路（shouldTrust），
+// 保证请求始终有预留可结算。见实施计划 v2 §2.0/§2.3。
+
+type TransactionalWalletFunding struct {
+	requestId string
+	userId    int
+	tokenId   int
+	reserved  int // 当前已冻结的预留额度（含中途 top-up）
+}
+
+func (t *TransactionalWalletFunding) Source() string { return BillingSourceWallet }
+
+func (t *TransactionalWalletFunding) PreConsume(amount int) error {
+	if amount <= 0 {
+		return nil
+	}
+	txn, err := model.ReserveWallet(t.requestId, t.userId, t.tokenId, amount, 0, "")
+	if err != nil {
+		return err
+	}
+	t.reserved = txn.ReservedQuota
+	return nil
+}
+
+func (t *TransactionalWalletFunding) Settle(delta int) error {
+	// 实际结算额 = 已冻结预留 + 差额（多退少补由 SettleWallet 计算）。
+	actual := t.reserved + delta
+	if actual < 0 {
+		actual = 0
+	}
+	_, err := model.SettleWallet(t.requestId, actual)
+	return err
+}
+
+func (t *TransactionalWalletFunding) Refund() error {
+	if t.reserved <= 0 {
+		return nil
+	}
+	// RollbackWallet 基于事务且幂等，可重试。
+	return refundWithRetry(func() error {
+		_, err := model.RollbackWallet(t.requestId)
+		return err
+	})
+}
+
+// ---------------------------------------------------------------------------
 // SubscriptionFunding — 订阅资金来源实现
 // ---------------------------------------------------------------------------
 
