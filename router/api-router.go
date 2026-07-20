@@ -194,6 +194,10 @@ func SetApiRouter(router *gin.Engine) {
 			walletRoute.POST("/resolve-key", controller.WalletResolveKey)
 			walletRoute.POST("/stale-reservations", controller.WalletStaleReservations)
 			walletRoute.GET("/transactions/:request_id", controller.WalletGetTransaction)
+
+			// 租户供给（企业多租户 Stage 8）：为组织计费用户建/改项目 token。
+			tenantRoute := internalRoute.Group("/tenant")
+			tenantRoute.POST("/provision-token", controller.ProvisionTenantToken)
 		}
 
 		// Subscription payment callbacks (no auth)
